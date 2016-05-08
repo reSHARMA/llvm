@@ -206,6 +206,7 @@ void PassManagerBuilder::populateFunctionPassManager(
   else
     FPM.add(createScalarReplAggregatesPass());
   FPM.add(createEarlyCSEPass());
+  FPM.add(createGVNHoistPass());
   FPM.add(createLowerExpectIntrinsicPass());
 }
 
