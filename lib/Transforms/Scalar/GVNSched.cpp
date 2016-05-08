@@ -343,6 +343,10 @@ public:
     return true;
   }
 
+  unsigned height(const BasicBlock *BB) {
+    return 0;
+  }
+
   // We only consider the Distance between the basic blocks because we rely
   // on a local scheduler to place the instruction in the right position.
   unsigned distance(const Instruction *Def, const Instruction *Use) {
@@ -362,21 +366,24 @@ public:
   }
 
   // Profitable when hoisting I reduces the live-range.
-  bool profitableToHoist(Instruction *I) {
+  bool profitableToHoist(const Instruction *I) {
     // Distance of each use-operand to their definition max(d1, d2)
     unsigned DistUse = 0;
-    std::for_each(I->op_begin(), I->op_end(), [&DistUse](const Use* U){ DistUse = std::max(distance(U, I), DistUse); });
+    std::for_each(I->op_begin(), I->op_end(), [&DistUse, I, this](const Use& U) {
+        DistUse = std::max(distance(U.getUser(), I), DistUse); });
 
     // Distance of def to its first use.
-    unsigned DistDef = distance(I->use_begin(), Op0);
+    unsigned DistDef = 0;
+    if (I->hasNUsesOrMore(1))
+      DistDef = distance(I->use_begin()->getUser(), I);
     return DistUse > DistDef;
   }
 
-  bool profitableToSink(Instruction *I) {
+  bool profitableToSink(const Instruction *I) {
     return false;
   }
 
-  bool profitableToRematerialize(Instruction *I) {
+  bool profitableToRematerialize(const Instruction *I) {
     return false;
   }
 
