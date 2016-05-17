@@ -183,8 +183,8 @@ public:
   }
 
   // Return true when all paths from A to the end of the function pass through
-  // either B or C.
-  bool hoistingFromAllPaths(const BasicBlock *A, const BasicBlock *B,
+  // both B and C.
+  bool postDominatedByCombined(const BasicBlock *A, const BasicBlock *B,
                             const BasicBlock *C) {
     // We fully copy the WL in order to be able to remove items from it.
     SmallPtrSet<const BasicBlock *, 2> WL;
@@ -222,8 +222,8 @@ public:
   typedef SmallVector<HoistingPointInfo, 4> HoistingPointList;
 
   // Initialize Paths with all the basic blocks executed in between A and B.
-  void gatherAllBlocks(SmallPtrSetImpl<const BasicBlock *> &Paths,
-                       const BasicBlock *A, const BasicBlock *B) {
+  bool gatherAllBlocks(const BasicBlock *A, const BasicBlock *B,
+                       SmallPtrSetImpl<const BasicBlock *> &Paths) {
     assert(DT->dominates(A, B) && "Invalid path");
 
     // We may need to keep B in the Paths set if we have already added it
@@ -238,8 +238,12 @@ public:
       if (*I == A)
         // Stop traversal when reaching A.
         I.skipChildren();
-      else
+      else {
+        // Bail out early when the path has any pinned instructions/unsafe BBs.
+        if (hasEH(*I))
+          return false;
         ++I;
+      }
     }
 
     // Safety check for B will be handled separately.
@@ -304,6 +308,100 @@ public:
       }
     }
     llvm_unreachable("should replace exactly once");
+  }
+
+  // Return true when it is safe to hoist an instruction Insn to NewHoistPt and
+  // move the insertion point from HoistPt to NewHoistPt.
+  bool safeToHoist(const BasicBlock *NewHoistPt, const BasicBlock *HoistPt,
+                   const Instruction *Insn, const Instruction *First, InsKind K) {
+    if (hasEH(HoistPt))
+      return false;
+
+    const BasicBlock *BBInsn = Insn->getParent();
+    // When HoistPt already contains an instruction to be hoisted, the
+    // expression is needed on all paths.
+
+    // Check that the hoisted expression is needed on all paths: it is unsafe
+    // to hoist loads to a place where there may be a path not loading from
+    // the same address: for instance there may be a branch on which the
+    // address of the load may not be initialized. FIXME: at -Oz we may want
+    // to hoist scalars to a place where they are partially needed.
+    if (BBInsn != NewHoistPt &&
+        !postDominatedByCombined(NewHoistPt, HoistPt, BBInsn))
+      return false;
+
+    // Check for unsafe hoistings due to side effects.
+    SmallPtrSet<const BasicBlock *, 4> Paths;
+    if (!gatherAllBlocks(NewHoistPt, HoistPt, Paths))
+      return false;
+    if (!gatherAllBlocks(NewHoistPt, BBInsn, Paths))
+      return false;
+
+    // Safe to hoist scalars.
+    if (K == InsKind::Scalar)
+      return true;
+
+    // For loads and stores, we check for dependences on the Memory SSA.
+    MemoryAccess *MemdefInsn =
+        cast<MemoryUseOrDef>(MSSA->getMemoryAccess(Insn))->getDefiningAccess();
+    BasicBlock *BBMemdefInsn = MemdefInsn->getBlock();
+
+    if (DT->properlyDominates(NewHoistPt, BBMemdefInsn))
+      // Cannot move Insn past BBMemdefInsn to NewHoistPt.
+      return false;
+
+    MemoryAccess *MemdefFirst =
+        cast<MemoryUseOrDef>(MSSA->getMemoryAccess(First))->getDefiningAccess();
+    BasicBlock *BBMemdefFirst = MemdefFirst->getBlock();
+
+    if (DT->properlyDominates(NewHoistPt, BBMemdefFirst))
+      // Cannot move First past BBMemdefFirst to NewHoistPt.
+      return false;
+
+    if (K == InsKind::Store) {
+      // Check that we do not move a store past loads.
+      if (DT->dominates(BBMemdefInsn, NewHoistPt))
+        if (hasMemoryUseOnPaths(MemdefInsn, Paths))
+          return false;
+
+      if (DT->dominates(BBMemdefFirst, NewHoistPt))
+        if (hasMemoryUseOnPaths(MemdefFirst, Paths))
+          return false;
+    }
+
+    if (DT->properlyDominates(BBMemdefInsn, NewHoistPt) &&
+        DT->properlyDominates(BBMemdefFirst, NewHoistPt))
+      return true;
+
+    const BasicBlock *BBFirst = First->getParent();
+    if (BBInsn == BBFirst)
+      return false;
+
+    assert(BBMemdefInsn == NewHoistPt || BBMemdefFirst == NewHoistPt);
+
+    if (BBInsn != NewHoistPt && BBFirst != NewHoistPt)
+      return true;
+
+    if (BBInsn == NewHoistPt) {
+      if (DT->properlyDominates(BBMemdefFirst, NewHoistPt))
+        return true;
+      assert(BBInsn == BBMemdefFirst);
+      if (MSSA->locallyDominates(MSSA->getMemoryAccess(Insn), MemdefFirst))
+        return false;
+      return true;
+    }
+
+    if (BBFirst == NewHoistPt) {
+      if (DT->properlyDominates(BBMemdefInsn, NewHoistPt))
+        return true;
+      assert(BBFirst == BBMemdefInsn);
+      if (MSSA->locallyDominates(MSSA->getMemoryAccess(First), MemdefInsn))
+        return false;
+      return true;
+    }
+
+    // No side effects: it is safe to hoist.
+    return true;
   }
 
   bool makeOperandsAvailable(Instruction *Repl, BasicBlock *HoistPt) const {
