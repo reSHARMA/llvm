@@ -529,9 +529,9 @@ public:
 
     // FIXME: use lazy evaluation of VN to avoid the fix-point computation.
     while (1) {
-      MemorySSA M(F);
+      MemorySSA M(F, AA, DT);
       MSSA = &M;
-      MSSAW = MSSA->buildMemorySSA(AA, DT);
+      MSSAW = MSSA->getWalker();
 
       hoistExpressions(F);
       delete MSSAW;
