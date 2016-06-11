@@ -532,7 +532,6 @@ public:
       MemorySSA M(F, AA, DT);
       MSSA = &M;
       MSSAW = MSSA->getWalker();
-
       hoistExpressions(F);
       delete MSSAW;
       return Res;
