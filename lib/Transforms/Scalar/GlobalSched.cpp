@@ -310,6 +310,8 @@ public:
     llvm_unreachable("should replace exactly once");
   }
 
+  // TODO: This has been copied from GVNHoist just in case if it is useful.
+  // We might want to delete this if we dont find this useful.
   // Return true when it is safe to hoist an instruction Insn to NewHoistPt and
   // move the insertion point from HoistPt to NewHoistPt.
   bool safeToHoist(const BasicBlock *NewHoistPt, const BasicBlock *HoistPt,
@@ -404,6 +406,8 @@ public:
     return true;
   }
 
+  // TODO: This has been copied from GVNHoist just in case if it is useful.
+  // We might want to delete this if we dont find this useful.
   bool makeOperandsAvailable(Instruction *Repl, BasicBlock *HoistPt) const {
     // Check whether the GEP of a ld/st can be synthesized at HoistPt.
     Instruction *Gep = nullptr;
@@ -503,7 +507,7 @@ public:
 
   // Hoist all expressions. Returns Number of scalars hoisted
   // and number of non-scalars hoisted.
-  bool hoistExpressions(Function &F) {
+  bool schedule(Function &F) {
     for (BasicBlock *BB : depth_first(&F.getEntryBlock())) {
       for (Instruction &I : *BB) {
         if (profitableToHoist(&I))
@@ -532,7 +536,7 @@ public:
       MemorySSA M(F, AA, DT);
       MSSA = &M;
       MSSAW = MSSA->getWalker();
-      hoistExpressions(F);
+      schedule(F);
       delete MSSAW;
       return Res;
     }
@@ -583,12 +587,12 @@ PreservedAnalyses GlobalSchedPass::run(Function &F,
 }
 
 char GlobalSchedLegacyPass::ID = 0;
-INITIALIZE_PASS_BEGIN(GlobalSchedLegacyPass, "gvn-hoist",
+INITIALIZE_PASS_BEGIN(GlobalSchedLegacyPass, "global-sched",
                       "Global Scheduling of Expressions", false, false)
 INITIALIZE_PASS_DEPENDENCY(MemoryDependenceWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
-INITIALIZE_PASS_END(GlobalSchedLegacyPass, "gvn-hoist",
+INITIALIZE_PASS_END(GlobalSchedLegacyPass, "global-sched",
                     "Global Scheduling of Expressions", false, false)
 
 FunctionPass *llvm::createGlobalSchedPass() { return new GlobalSchedLegacyPass(); }
