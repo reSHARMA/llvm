@@ -1,4 +1,4 @@
-//===- GVNHoist.cpp - Hoist scalar and load expressions -------------------===//
+//===- GlobalSched.cpp - Global Scheduling of expressions -----------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -21,7 +21,7 @@
 
 using namespace llvm;
 
-#define DEBUG_TYPE "gvn-sched"
+#define DEBUG_TYPE "global-sched"
 
 namespace {
 
@@ -137,7 +137,7 @@ typedef SmallVectorImpl<Instruction *> SmallVecImplInsn;
 // This pass hoists common computations across branches sharing common
 // dominator. The primary goal is to reduce the code size, and in some
 // cases reduce critical path (by exposing more ILP).
-class GVNHoistLegacyPassImpl {
+class GlobalSchedLegacyPassImpl {
 public:
   GVN::ValueTable VN;
   DominatorTree *DT;
@@ -149,7 +149,7 @@ public:
   MemorySSAWalker *MSSAW;
   enum InsKind { Unknown, Scalar, Load, Store };
 
-  GVNHoistLegacyPassImpl(DominatorTree *Dt, AliasAnalysis *Aa,
+  GlobalSchedLegacyPassImpl(DominatorTree *Dt, AliasAnalysis *Aa,
                          MemoryDependenceResults *Md)
       : DT(Dt), AA(Aa), MD(Md), MSSAW(nullptr) {}
 
@@ -541,12 +541,12 @@ public:
   }
 };
 
-class GVNHoistLegacyPass : public FunctionPass {
+class GlobalSchedLegacyPass : public FunctionPass {
 public:
   static char ID;
 
-  GVNHoistLegacyPass() : FunctionPass(ID) {
-    initializeGVNHoistLegacyPassPass(*PassRegistry::getPassRegistry());
+  GlobalSchedLegacyPass() : FunctionPass(ID) {
+    initializeGlobalSchedLegacyPassPass(*PassRegistry::getPassRegistry());
   }
 
   bool runOnFunction(Function &F) override {
@@ -554,7 +554,7 @@ public:
     auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
     auto &MD = getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
 
-    GVNHoistLegacyPassImpl G(&DT, &AA, &MD);
+    GlobalSchedLegacyPassImpl G(&DT, &AA, &MD);
     return G.run(F);
   }
 
@@ -567,13 +567,13 @@ public:
 };
 } // namespace
 
-PreservedAnalyses GVNHoistPass::run(Function &F,
+PreservedAnalyses GlobalSchedPass::run(Function &F,
                                     AnalysisManager<Function> &AM) {
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   AliasAnalysis &AA = AM.getResult<AAManager>(F);
   MemoryDependenceResults &MD = AM.getResult<MemoryDependenceAnalysis>(F);
 
-  GVNHoistLegacyPassImpl G(&DT, &AA, &MD);
+  GlobalSchedLegacyPassImpl G(&DT, &AA, &MD);
   if (!G.run(F))
     return PreservedAnalyses::all();
 
@@ -582,13 +582,13 @@ PreservedAnalyses GVNHoistPass::run(Function &F,
   return PA;
 }
 
-char GVNHoistLegacyPass::ID = 0;
-INITIALIZE_PASS_BEGIN(GVNHoistLegacyPass, "gvn-hoist",
-                      "Early GVN Hoisting of Expressions", false, false)
+char GlobalSchedLegacyPass::ID = 0;
+INITIALIZE_PASS_BEGIN(GlobalSchedLegacyPass, "gvn-hoist",
+                      "Global Scheduling of Expressions", false, false)
 INITIALIZE_PASS_DEPENDENCY(MemoryDependenceWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
-INITIALIZE_PASS_END(GVNHoistLegacyPass, "gvn-hoist",
-                    "Early GVN Hoisting of Expressions", false, false)
+INITIALIZE_PASS_END(GlobalSchedLegacyPass, "gvn-hoist",
+                    "Global Scheduling of Expressions", false, false)
 
-FunctionPass *llvm::createGVNHoistPass() { return new GVNHoistLegacyPass(); }
+FunctionPass *llvm::createGlobalSchedPass() { return new GlobalSchedLegacyPass(); }

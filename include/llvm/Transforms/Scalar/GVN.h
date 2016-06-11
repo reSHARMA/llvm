@@ -228,9 +228,8 @@ private:
 /// loads are eliminated by the pass.
 FunctionPass *createGVNPass(bool NoLoads = false);
 
-/// \brief A simple and fast domtree-based GVN pass to hoist common expressions
-/// from sibling branches.
-struct GVNHoistPass : PassInfoMixin<GVNHoistPass> {
+/// \brief A simple and fast domtree-based Global Scheduler.
+struct GlobalSchedPass : PassInfoMixin<GlobalSchedPass> {
   /// \brief Run the pass over the function.
   PreservedAnalyses run(Function &F, AnalysisManager<Function> &AM);
 };
