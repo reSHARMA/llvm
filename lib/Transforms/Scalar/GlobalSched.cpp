@@ -9,6 +9,66 @@
 //
 //===----------------------------------------------------------------------===//
 
+/*
+One of the models could be to hoist to nearby blocks, by having a threshold of how far we can hoist.
+
+
+Other could be to hoist in those cases which reduces the effective live-range.
+How to compute effective live-range before/after hoisting is illustrated below.
+The following idea not only relates to code-hoisting but also to global code motion (gcm).
+
+ Global code motion. Example:
+ bb1: b = ...
+ bb2: c = ...
+ bb3: a = b + c (to be moved to b5)
+ bb4: ... = a
+ old-live-range = distance(bb1,bb3) + distance(bb2,bb3) + distance (bb3,bb4)
+ new-live-rance = distance(bb1,bb5) + distance(bb2,bb5) + distance (bb5,bb4)
+ distance(bbx, bby) = total instruction count in the path from bbx to bby
+ 
+ If the new live-range is less than the old one it will be a good candidate
+ for gcm. When both the ranges will be same:
+  - It is a simple copy of kind a = b.
+  - One of the operands is not a Instruction/Register.
+  - In these cases we need to have some heuristic or we can ignore them.
+ 
+ The decision for bb5 can be made by whether hoist/sink is beneficial.
+ Loads can be moved early as long as there is load available in each branch
+ or there is already a load/store from/to the same underlying object.
+ Stores can be moved up if there is a store/load to/from the same object.
+ The idea is to establish that the object has memory allocated to it.
+ Moving load/store together may help with locality of reference.
+ Hoist redundant instructions which are:
+  - Already available in the dominator.
+  - Are in one of the sibling branches, i.e., the instruction is used at
+    a point which shares a common dominator where all the use-operands
+    are available. The code motion will hoist the partially-redundant computation in the common dominator instead of copying to the other sibling (which is what regular PRE does).
+    After this, the actual PRE will remove the redundant computation.
+
+ In some cases it is possible to generate redundancy by restructuring the code
+ (Ref. Ras Bodik), but that I'll leave for the next iteration of this patch.
+
+Hoisting also reduces critical path length of execution in out of order machines (but not in sequential machines),
+by exposing ILP before the conditional where the instruction was hoisted.
+This feature has already been identified in the previous patch (http://reviews.llvm.org/D19338).
+ 
+Concerns:
+Safety of load/store instructions to be checked.
+We cannot hoist loads until all the paths in the parent BBs have the same load/store.
+This is to comply with C semantics.
+
+It seems, code hoisting is beneficial in cases even if the computations are not redundant.
+Say c = f(a, b) is an instruction. Hoisting up will reduce the liveness of registers a and b,
+but will only increase the liveness of c. So we gain 2:1 even when the computation is not redundant.
+
+For loads this is not the case because, load takes only one operand so the liveness remains the same,
+additionally hoisting too much loads can have adversely affect the cache behavior.
+On the other hand sinking loads may improve the cache behavior, because we load as late as possible.
+But sinking computations may increase the live range.
+
+TODO: We might use the concept of pinned instructions from Click's paper for faster convergence.
+*/
+
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/ValueTracking.h"
