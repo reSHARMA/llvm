@@ -513,6 +513,11 @@ public:
     return true;
   }
 
+  // Collect the minimum height/depth of each BB from the root node.
+  void collectHeight() {
+
+  }
+
   unsigned height(const BasicBlock *BB) {
     return 0;
   }
@@ -538,15 +543,15 @@ public:
   // Profitable when hoisting I reduces the live-range.
   bool profitableToHoist(const Instruction *I) {
     // Distance of each use-operand to their definition max(d1, d2)
-    unsigned DistUse = 0;
-    std::for_each(I->op_begin(), I->op_end(), [&DistUse, I, this](const Use& U) {
-        DistUse = std::max(distance(U.getUser(), I), DistUse); });
+    unsigned DistUseFromDef = 0;
+    std::for_each(I->op_begin(), I->op_end(), [&DistUseFromDef, I, this](const Use& U) {
+        DistUseFromDef = std::max(distance(U.getUser(), I), DistUseFromDef); });
 
     // Distance of def to its first use.
-    unsigned DistDef = 0;
+    unsigned DistDefToUse = 0;
     if (I->hasNUsesOrMore(1))
-      DistDef = distance(I->use_begin()->getUser(), I);
-    return DistUse > DistDef;
+      DistDefToUse = distance(I->use_begin()->getUser(), I);
+    return DistUseFromDef > DistDefToUse;
   }
 
   bool profitableToSink(const Instruction *I) {
