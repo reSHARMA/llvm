@@ -77,6 +77,7 @@ TODO: We might use the concept of pinned instructions from Click's paper for
 faster convergence.
 */
 
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -215,6 +216,7 @@ public:
   BBSideEffectsSet BBSideEffects;
   MemorySSA *MSSA;
   MemorySSAWalker *MSSAW;
+  DenseMap<const BasicBlock *, unsigned> BBHeightMap;
   enum InsKind { Unknown, Scalar, Load, Store };
 
   GlobalSchedLegacyPassImpl(DominatorTree *Dt, AliasAnalysis *Aa,
@@ -514,12 +516,26 @@ public:
   }
 
   // Collect the minimum height/depth of each BB from the root node.
-  void collectHeight() {
-
+  void collectHeight(const BasicBlock *Root) {
+    BBHeightMap[Root] = 0;
+    // Traverse in reverse post order.
+    for (auto I = idf_begin(Root); I != idf_end(Root); ++I) {
+      const BasicBlock *BB = *I;
+      DenseMap<const BasicBlock*, unsigned>::iterator BBCI = BBHeightMap.find(BB);
+      if (BBCI == BBHeightMap.end())
+        continue;
+      // FIXME: Take the height + 1 from the predecessor which gives minimum height.
+      for (unsigned i = 0; i < BB->getTerminator()->getNumSuccessors(); ++i)
+        BBHeightMap[BB->getTerminator()->getSuccessor(i)] = BBHeightMap[BB] + 1;
+    }
+    // There must not be any remaining ones.
+    for (auto BBI = Root->getParent()->begin(), E = Root->getParent()->end(); BBI != E; ++BBI)
+      assert (BBHeightMap.count(&*BBI));
   }
 
-  unsigned height(const BasicBlock *BB) {
-    return 0;
+  unsigned height(const BasicBlock *BB) const {
+    assert (BBHeightMap.count(BB) && "BB Height has not been populated.");
+    return BBHeightMap.find(BB)->second;
   }
 
   // We only consider the Distance between the basic blocks because we rely
