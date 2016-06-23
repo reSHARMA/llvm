@@ -27,13 +27,13 @@ motion (gcm).
  old-live-range = distance(bb1,bb3) + distance(bb2,bb3) + distance (bb3,bb4)
  new-live-rance = distance(bb1,bb5) + distance(bb2,bb5) + distance (bb5,bb4)
  distance(bbx, bby) = total instruction count in the path from bbx to bby
- 
+
  If the new live-range is less than the old one it will be a good candidate
  for gcm. When both the ranges will be same:
   - It is a simple copy of kind a = b.
   - One of the operands is not a Instruction/Register.
   - In these cases we need to have some heuristic or we can ignore them.
- 
+
  The decision for bb5 can be made by whether hoist/sink is beneficial.
  Loads can be moved early as long as there is load available in each branch
  or there is already a load/store from/to the same underlying object.
@@ -57,7 +57,7 @@ Hoisting also reduces critical path length of execution in out of order machines
 (but not in sequential machines), by exposing ILP before the conditional where
 the instruction was hoisted.  This feature has already been identified in the
 previous patch (http://reviews.llvm.org/D19338).
- 
+
 Concerns: Safety of load/store instructions to be checked.  We cannot hoist
 loads until all the paths in the parent BBs have the same load/store.  This is
 to comply with C semantics.
@@ -546,7 +546,7 @@ public:
     return height(UseBB) - height(DefBB);
   }
 
-  unsigned distance(const User *Def, const User *Use) {
+  unsigned distance(const Value *Def, const User *Use) {
     const Instruction *DefI = dyn_cast<Instruction>(Def);
     const Instruction *UseI = dyn_cast<Instruction>(Use);
     assert (UseI && "User must be an instruction");
@@ -560,8 +560,11 @@ public:
   bool profitableToHoist(const Instruction *I) {
     // Distance of each use-operand to their definition max(d1, d2)
     unsigned DistUseFromDef = 0;
-    std::for_each(I->op_begin(), I->op_end(), [&DistUseFromDef, I, this](const Use& U) {
-        DistUseFromDef = std::max(distance(U.getUser(), I), DistUseFromDef); });
+
+    std::for_each(I->op_begin(), I->op_end(),
+      [&DistUseFromDef, I, this](const Use& U) {
+        DistUseFromDef = std::max(distance(U.get(), I), DistUseFromDef);
+      });
 
     // Distance of def to its first use.
     unsigned DistDefToUse = 0;
