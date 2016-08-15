@@ -73,6 +73,9 @@ adversely affect the cache behavior.  On the other hand sinking loads may
 improve the cache behavior, because we load as late as possible.  But sinking
 computations may increase the live range.
 
+Related paper to be studied:
+https://www.researchgate.net/profile/Bernhard_Steffen/publication/2826029_Lazy_Code_Motion/links/00b7d51420cfa54bb6000000.pdf
+
 TODO: We might use the concept of pinned instructions from Click's paper for
 faster convergence.
 */
