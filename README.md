@@ -3,7 +3,7 @@
 ### [x] Rebase syntactically
 ### [ ] Fix failing tese cases
 #### - [ ] - Code Hoisting related tests
-* [ ] [28682     LLVM :: Transforms/GVNHoist/hoist-convergent.ll](test/Transforms/GVNHoist/hoist-convergent.ll)
+* [x] [28682     LLVM :: Transforms/GVNHoist/hoist-convergent.ll](test/Transforms/GVNHoist/hoist-convergent.ll)
 * [ ] [28683     LLVM :: Transforms/GVNHoist/hoist-inline.ll](test/Transforms/GVNHoist/hoist-inline.ll)
 * [ ] [28684     LLVM :: Transforms/GVNHoist/hoist-more-than-two-branches.ll](test/Transforms/GVNHoist/hoist-more-than-two-branches.ll)
 * [ ] [28685     LLVM :: Transforms/GVNHoist/hoist-pr20242.ll](test/Transforms/GVNHoist/hoist-pr20242.ll)
