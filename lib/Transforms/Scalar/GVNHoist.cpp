@@ -113,11 +113,22 @@ static cl::opt<int>
                    cl::desc("Maximum length of dependent chains to hoist "
                             "(default = 10, unlimited = -1)"));
 
+static cl::opt<bool> CheckHoistProfitability(
+    "gvn-hoist-check-profitability", cl::Hidden, cl::init(true),
+    cl::desc("Check for proitability (reducing register pressure)"));
+
 namespace llvm {
 
 using BBSideEffectsSet = DenseMap<const BasicBlock *, bool>;
 using SmallVecInsn = SmallVector<Instruction *, 4>;
 using SmallVecImplInsn = SmallVectorImpl<Instruction *>;
+using SmallSetBB = SmallSet<BasicBlock *, 2>;
+using MergeSetT = DenseMap<BasicBlock *, SmallSetBB>;
+using SmallVecBB = SmallVector<BasicBlock *, 4>;
+using BBLevelKeyT = SmallVecBB;
+using BBLevelT = std::map<unsigned, BBLevelKeyT>;
+using DomLevelsT = DenseMap<BasicBlock *, unsigned>;
+using EdgeT = std::pair<BasicBlock *, BasicBlock *>;
 
 // Each element of a hoisting list contains the basic block where to hoist and
 // a list of instructions to be hoisted.
@@ -129,6 +140,31 @@ using HoistingPointList = SmallVector<HoistingPointInfo, 4>;
 using VNType = std::pair<unsigned, unsigned>;
 
 using VNtoInsns = DenseMap<VNType, SmallVector<Instruction *, 4>>;
+
+struct SortByDFSIn {
+private:
+  DenseMap<const Value *, unsigned> &DFSNumber;
+
+public:
+  SortByDFSIn(DenseMap<const Value *, unsigned> &D) : DFSNumber(D) {}
+
+  // Returns true when A executes before B.
+  bool operator()(const Instruction *A, const Instruction *B) const {
+
+    const BasicBlock *BA = A->getParent();
+    const BasicBlock *BB = B->getParent();
+    unsigned ADFS, BDFS;
+    if (BA == BB) {
+      ADFS = DFSNumber.lookup(A);
+      BDFS = DFSNumber.lookup(B);
+    } else {
+      ADFS = DFSNumber.lookup(BA);
+      BDFS = DFSNumber.lookup(BB);
+    }    
+    assert(ADFS && BDFS);
+    return ADFS < BDFS;
+  }
+};
 
 // CHI keeps information about values flowing out of a basic block.  It is
 // similar to PHI but in the inverse graph, and used for outgoing values on each
@@ -175,6 +211,7 @@ public:
     VNtoScalars[{V, InvalidVN}].push_back(I);
   }
 
+  void clear() { VNtoScalars.clear(); }
   const VNtoInsns &getVNTable() const { return VNtoScalars; }
 };
 
@@ -190,7 +227,7 @@ public:
       VNtoLoads[{V, InvalidVN}].push_back(Load);
     }
   }
-
+  void clear() { VNtoLoads.clear(); }
   const VNtoInsns &getVNTable() const { return VNtoLoads; }
 };
 
@@ -209,7 +246,7 @@ public:
     Value *Val = Store->getValueOperand();
     VNtoStores[{VN.lookupOrAdd(Ptr), VN.lookupOrAdd(Val)}].push_back(Store);
   }
-
+  void clear() { VNtoStores.clear(); }
   const VNtoInsns &getVNTable() const { return VNtoStores; }
 };
 
@@ -236,18 +273,62 @@ public:
       VNtoCallsStores[Entry].push_back(Call);
   }
 
+  void clear() {
+    VNtoCallsScalars.clear();
+    VNtoCallsLoads.clear();
+    VNtoCallsStores.clear();
+  }
+
   const VNtoInsns &getScalarVNTable() const { return VNtoCallsScalars; }
   const VNtoInsns &getLoadVNTable() const { return VNtoCallsLoads; }
   const VNtoInsns &getStoreVNTable() const { return VNtoCallsStores; }
 };
 
 static void combineKnownMetadata(Instruction *ReplInst, Instruction *I) {
-  static const unsigned KnownIDs[] = {
+   unsigned KnownIDs[] = {
       LLVMContext::MD_tbaa,           LLVMContext::MD_alias_scope,
       LLVMContext::MD_noalias,        LLVMContext::MD_range,
       LLVMContext::MD_fpmath,         LLVMContext::MD_invariant_load,
-      LLVMContext::MD_invariant_group, LLVMContext::MD_access_group};
-  combineMetadata(ReplInst, I, KnownIDs, true);
+      LLVMContext::MD_invariant_group,	LLVMContext::MD_access_group};
+      combineMetadata(ReplInst, I, KnownIDs,true);
+}
+
+void printBBLevels(const BBLevelT &BBLevels) {
+  for (const std::pair<unsigned, BBLevelKeyT> &P : BBLevels) {
+    dbgs() << "\nLevel: " << P.first << "\n";
+    for (const BasicBlock *BB : P.second)
+      dbgs() << *BB << "\n";
+  }
+}
+
+void printMergeSet(const MergeSetT &M) {
+  // For printing in a deterministic order.
+  typedef std::set<const BasicBlock *> SetConstBB;
+  std::map<BasicBlock *, SetConstBB> PrintM;
+  for (const std::pair<BasicBlock *, SmallSetBB> &P : M) {
+    for (const BasicBlock *BB : P.second)
+      PrintM[P.first].insert(BB);
+  }
+  for (const std::pair<BasicBlock *, SetConstBB> &P : PrintM) {
+    dbgs() << "\nMergeSet of: " << P.first->getName() << ": ";
+    for (const BasicBlock *BB : P.second)
+      dbgs() << BB->getName() << ", ";
+  }
+}
+
+void printJEdges(const DenseSet<EdgeT> &Edges) {
+  // For printing in a deterministic order.
+  std::set<EdgeT> PrintE(Edges.begin(), Edges.end());
+
+  for (const EdgeT &E : PrintE)
+    dbgs() << "\nFound a JEdge: " << E.first->getName() << " -> "
+           << E.second->getName();
+}
+
+void printSmallSet(SmallSetBB &S) {
+  dbgs() << "\nPrinting SmallSet: ";
+  for (const auto &BB : S)
+    dbgs() << BB->getName() << ",";
 }
 
 // This pass hoists common computations across branches sharing common
@@ -258,9 +339,205 @@ public:
   GVNHoist(DominatorTree *DT, PostDominatorTree *PDT, AliasAnalysis *AA,
            MemoryDependenceResults *MD, MemorySSA *MSSA)
       : DT(DT), PDT(PDT), AA(AA), MD(MD), MSSA(MSSA),
-        MSSAUpdater(llvm::make_unique<MemorySSAUpdater>(MSSA)) {}
+        MSSAUpdater(llvm::make_unique<MemorySSAUpdater>(MSSA)), HoistedCtr(0) {
+		clearVNTables();
+  }
+  
+  void clearVNTables() {
+    II.clear();
+    LI.clear();
+    SI.clear();
+    CI.clear();
+  }
+  // DomLevels maps from BB -> its depth from root.
+  // JEdges only contain the J edges as D edges are available in Dominator Tree.
+  // BBLevels maps each depth in the CFG to all the Basic Blocks at that level.
+  // DJ Graph is described in "Sreedhar, Vugranam C. Efficient program analysis
+  // using DJ graphs. McGill University, 1996".
+  void constructDJGraph(DomLevelsT &DomLevels, DenseSet<EdgeT> &JEdges,
+                        BBLevelT &BBLevels){
+  for (auto DFI = df_begin(DT->getRootNode()), DFE = df_end(DT->getRootNode());
+       DFI != DFE; ++DFI) {
+    // Since getPathLength is inclusive of both the terminal nodes
+    // i.e., Entry and *DFI so decrease by 1.
+    unsigned Depth = DFI.getPathLength() - 1;
+    BasicBlock *BB = (*DFI)->getBlock();
+    DomLevels[BB] = Depth;
+    BBLevels[Depth].push_back(BB);
+    for (BasicBlock *Succ : successors(BB))
+      if (!DT->properlyDominates(BB, Succ)) {
+        JEdges.insert(std::make_pair(BB, Succ));
+      }
+  }
+}
+
+
+  // Return true if S1 is a subset of S2.
+  bool isSubset(const SmallSetBB &S1, const SmallSetBB &S2) {
+    if (S1.size() > S2.size())
+      return false;
+    for (BasicBlock *BB : S1) {
+      if (!S2.count(BB))
+        return false;
+    }
+    return true;
+  }
+
+  // DomLevels maps BB to its depth from root.
+  // JEdges only contain the J-edges as D-edges are available in Dominator Tree.
+  // BBLevels maps each depth in the CFG to all the BBs at that level.
+  // BILARDI, G. AND PINGALI, K. 2003. Algorithms for computing the static
+  // single assignment form. J. ACM 50, 3 (May), 375–425.
+  bool constructMergeSet(DomLevelsT &DomLevels, DenseSet<EdgeT> &JEdges,
+                         BBLevelT &BBLevels){
+    bool Repeat = false;
+    DenseSet<EdgeT> VisJEdges; // Visited J Edges.
+    unsigned PrevLev = 0;
+    if(PrevLev == 0){
+    	Repeat = false;
+    }
+    for (std::pair<const unsigned, BBLevelKeyT> &P : BBLevels) {
+      assert(PrevLev <= P.first);
+      PrevLev = P.first;
+      for (BasicBlock *CurrBB : P.second) {
+        for (auto PB = pred_begin(CurrBB), PE = pred_end(CurrBB); PB != PE;
+             ++PB) {
+          EdgeT Edge(*PB, CurrBB); // For all incoming edges to CurrBB.
+          if (JEdges.count(Edge) && !VisJEdges.count(Edge)) {
+            VisJEdges.insert(Edge); // Visit
+            BasicBlock *Src = Edge.first;
+            BasicBlock *Dst = Edge.second;
+            BasicBlock *INode = nullptr;
+            MergeSet[Dst].insert(Dst);                 // The target of JEdge.
+            while (DomLevels[Src] >= DomLevels[Dst]) { // A backedge.
+              LLVM_DEBUG(dbgs() << "\nVisiting: " << Src->getName() << " -> "
+                           << Dst->getName());
+              // Merge (tmp) = Merge (tmp) U Merge (tnode) U { tnode }
+              // MergeSet(tnode) contains tnode.
+              MergeSet[Src].insert(MergeSet[Dst].begin(), MergeSet[Dst].end());
+              INode = Src;
+              LLVM_DEBUG(dbgs() << "IDom of " << Src->getName() << " is ");
+	      Src = DT -> getNode(Src) -> getIDom() -> getBlock();
+              LLVM_DEBUG(dbgs() << Src->getName());
+            }
+            for (auto PINode = pred_begin(INode), PENode = pred_end(INode);
+                 PINode != PENode; ++PINode) { // INode is an ancestor of SNode.
+              EdgeT Edge(*PINode, INode);
+              if (VisJEdges.count(Edge)) {
+                assert(JEdges.count(Edge));
+                BasicBlock *SNode = *PINode;
+                // Check inconsistency, MergeSet[Dest] subset of MergeSet[Src]
+                if (!isSubset(MergeSet[INode], MergeSet[SNode]))
+                  Repeat = true;
+              }
+            }
+          }
+        }
+      }
+    }
+  return Repeat;
+}
+
+
+
+     // Returns true if the \p Op is live-out from \p BB.
+  bool isLiveOutUsingMergeSet(BasicBlock *BB, Value *Val) const{
+  assert(BB);
+  const BasicBlock *ValDefBB = nullptr; // BasicBlock defining Val
+  if (Instruction *I = dyn_cast<Instruction>(Val))
+    ValDefBB = I->getParent();
+  // FIXME!
+  // We are assuming when DefBB is not defined then the value is a parameter.
+
+  // Case when Val is defined in BB, if any of the use is outside BB (DefBB)
+  // then it must be live-out.
+  if (ValDefBB == BB)
+    for (User *U : Val->users()) {
+      if (cast<Instruction>(U)->getParent() != BB)
+        return true;
+    }
+
+  // Mr(n) = M(n) U {n}; Create a new set from the merge set
+  // Ms(n) = Ms(n) U Mr(w); For each successor w of BB
+  SmallSetBB Ms; // Ms = null-set
+  for (BasicBlock *Succ : successors(BB)) {
+    Ms.insert(Succ); // Mr(Succ) = Succ U M(Succ)
+    for (BasicBlock *BB : MergeSet.lookup(Succ))
+      Ms.insert(BB); // M(Succ)
+  }
+
+  // Iterate over all the uses of Val, if any of its users is in the mergeset
+  // of \p BB then Val is LiveOut from BB.
+  for (User *U : Val->users()) {
+    BasicBlock *UserDefBB = nullptr;
+    if (Instruction *I = dyn_cast<Instruction>(U))
+      UserDefBB = I->getParent();
+    else // Assuming live-out conservatively, the user can be a global
+      // TODO: maybe return false is okay??
+      return false; // llvm_unreachable("User is not an instruction.");
+    while (UserDefBB && (UserDefBB != ValDefBB)) {
+      if (Ms.count(UserDefBB)) // if t /\ Ms(n) then return true;
+        return true;
+	DomTreeNode *pdtNode = DT -> getNode(UserDefBB) -> getIDom();
+	if(pdtNode == NULL)
+		break;
+  errs() << "Hello 4\n";
+      UserDefBB = pdtNode -> getBlock();
+      
+    }
+  }
+  return false;
+}
+
+// Returns true if the \p Op is the last use at I.
+  // TODO: Find O(1) algorithm for this.
+const Instruction *lastUser(const Instruction *I, const Value *Val) const{
+  // TODO: Make isLiveOutUsingMergeSet take const parameters.
+  assert(!isLiveOutUsingMergeSet(const_cast<BasicBlock *>(I->getParent()),
+                                 const_cast<Value *>(Val)));
+  const BasicBlock *BB = I->getParent();
+  BasicBlock::const_iterator BI(I), BE = BB->end();
+  unsigned ICount = std::distance(BI, BE);
+  if (Val->getNumUses() <= ICount) { // Iterate on uses
+    for (const User *U : Val->users()) {
+      const Instruction *UserI = cast<Instruction>(U);
+      if (UserI != I && UserI->getParent() == BB) {
+        if (firstInBB(I, UserI)) // I precedes another Use => not a kill.
+          return UserI;
+      }
+    }
+    return I;
+  }
+  // else Iterate on Instructions
+  for (++BI; BI != BE; ++BI) {
+    for (unsigned i = 0; i < BI->getNumOperands(); ++i)
+      if (BI->getOperandUse(i).get() == Val)
+        return &*BI;
+  }
+  return I;
+}
+
 
   bool run(Function &F) {
+  
+    // *** if -Oz option which is optimize for min size then,
+    // checkHoistProfitability is false, which is true by default
+    if (F.optForMinSize()) {
+      CheckHoistProfitability = false;
+    }
+    DT->updateDFSNumbers();
+    // ** DomLevelsT => BB <-> unsigned int
+    DomLevelsT DomLevels;
+    DenseSet<EdgeT> JEdges;
+    BBLevelT BBLevels;
+    // ** basicBlock <-> successor (if dominated)
+    constructDJGraph(DomLevels, JEdges, BBLevels);
+    // printBBLevels(BBLevels);
+    LLVM_DEBUG(printJEdges(JEdges));
+    while (constructMergeSet(DomLevels, JEdges, BBLevels))
+      ;
+    LLVM_DEBUG(printMergeSet(MergeSet));
+
     NumFuncArgs = F.arg_size();
     VN.setDomTree(DT);
     VN.setAliasAnalysis(AA);
@@ -281,7 +558,7 @@ public:
     while (true) {
       if (MaxChainLength != -1 && ++ChainLength >= MaxChainLength)
         return Res;
-
+      clearVNTables();
       auto HoistStat = hoistExpressions(F);
       if (HoistStat.first + HoistStat.second == 0)
         return Res;
@@ -338,8 +615,14 @@ private:
   BBSideEffectsSet BBSideEffects;
   DenseSet<const BasicBlock *> HoistBarrier;
   SmallVector<BasicBlock *, 32> IDFBlocks;
+  MergeSetT MergeSet;
   unsigned NumFuncArgs;
   const bool HoistingGeps = false;
+  InsnInfo II;
+  LoadInfo LI;
+  StoreInfo SI;
+  CallInfo CI;
+  int HoistedCtr;
 
   enum InsKind { Unknown, Scalar, Load, Store };
 
@@ -372,8 +655,21 @@ private:
     return false;
   }
 
+  bool hoistCandidate(const User *U) const {
+    if (!VN.exists(const_cast<User *>(U))) // Only for scalars
+
+      return false;
+    unsigned V = VN.lookup(const_cast<User *>(U));
+
+    // Multiple scalars with same VN have very high chance of being hoisted.
+    if (II.getVNTable().count({V, InvalidVN}) > 1)
+      return true;
+
+    return false;
+  }
+
   // Return true when I1 appears before I2 in the instructions of BB.
-  bool firstInBB(const Instruction *I1, const Instruction *I2) {
+  bool firstInBB(const Instruction *I1, const Instruction *I2) const {
     assert(I1->getParent() == I2->getParent());
     unsigned I1DFS = DFSNumber.lookup(I1);
     unsigned I2DFS = DFSNumber.lookup(I2);
@@ -513,6 +809,34 @@ private:
     return false;
   }
 
+  bool hoistingFromAllPaths(const BasicBlock *HoistBB,
+                                    SmallPtrSetImpl<const BasicBlock *> &WL) {
+  // Copy WL as the loop will remove elements from it.
+    SmallPtrSet<const BasicBlock *, 2> WorkList(WL.begin(), WL.end());
+    for (auto It = df_begin(HoistBB), E = df_end(HoistBB); It != E;) {
+      // There exists a path from HoistBB to the exit of the function if we are
+      // still iterating in DF traversal and we removed all instructions from
+      // the work list.
+      if (WorkList.empty())
+        return false;
+      const BasicBlock *BB = *It;
+      if (WorkList.erase(BB)) {
+        // Stop DFS traversal when BB is in the work list.
+        It.skipChildren();
+        continue;
+      }
+      if (!BB->getTerminator()->getNumSuccessors())
+        return false;
+      // When reaching the back-edge of a loop, there may be a path through the
+      // loop that does not pass through B or C before exiting the loop.
+      if (successorDominate(BB, HoistBB))
+        return false;
+      // Increment DFS traversal when not skipping children.
+      ++It;
+    }
+    return true;
+  }
+
   // Return true when it is safe to hoist a memory load or store U from OldPt
   // to NewPt.
   bool safeToHoistLdSt(const Instruction *NewPt, const Instruction *OldPt,
@@ -556,6 +880,27 @@ private:
     return true;
   }
 
+  bool safeToHoistLdSt_0(const Instruction *NewHoistPt,
+                                 const Instruction *HoistPt,
+                                 const Instruction *Insn, MemoryUseOrDef *MA,
+                                 InsKind K, int &NumBBsOnAllPaths,
+                                 const BasicBlock *HoistPtBB,
+                                 const BasicBlock *NewHoistBB,
+                                 const BasicBlock *InsnBB,
+                                 SmallPtrSetImpl<const BasicBlock *> &WL) {
+    return (HoistPtBB == NewHoistBB || InsnBB == NewHoistBB ||
+          hoistingFromAllPaths(NewHoistBB, WL)) &&
+         // Also check that it is safe to move the load or store from HoistPt
+         // to NewHoistPt, and from Insn to NewHoistPt. Note that HoistPt may
+         // not be the instruction to be hoisted, it is a transient placeholder
+         // to find the farthest hoisting point when >2 hoistable candidates
+         // can be hoisted to a common dominator.
+         safeToHoistLdSt(NewHoistPt, HoistPt, MA, K, NumBBsOnAllPaths) &&
+         safeToHoistLdSt(NewHoistPt, Insn, MSSA->getMemoryAccess(Insn), K,
+                         NumBBsOnAllPaths);
+  }
+ 
+
   // Return true when it is safe to hoist scalar instructions from all blocks in
   // WL to HoistBB.
   bool safeToHoistScalar(const BasicBlock *HoistBB, const BasicBlock *BB,
@@ -578,18 +923,175 @@ private:
 
   // Returns true when the values are flowing out to each edge.
   bool valueAnticipable(CHIArgs C, Instruction *TI) const {
-    if (TI->getNumSuccessors() > (unsigned)size(C))
-      return false; // Not enough args in this CHI.
+	if (TI->getNumSuccessors() > (unsigned)size(C))
+       return false; // Not enough args in this CHI.
+ 
+     for (auto CHI : C) {
+       BasicBlock *Dest = CHI.Dest;
+       // Find if all the edges have values flowing out of BB.
+       bool Found = llvm::any_of(
+           successors(TI), [Dest](const BasicBlock *BB) { return BB == Dest; });
+       if (!Found)
+         return false;
+     }
+     return true;
+  }
 
-    for (auto CHI : C) {
-      BasicBlock *Dest = CHI.Dest;
-      // Find if all the edges have values flowing out of BB.
-      bool Found = llvm::any_of(
-          successors(TI), [Dest](const BasicBlock *BB) { return BB == Dest; });
-      if (!Found)
+  bool profitableToHoist(Instruction *I) const {
+    if (!CheckHoistProfitability)
+      return true;
+    // For -O3/-O2 hoist only when the liveness decreases i.e., no more than
+    // one operand can be a use without kill.
+    // Store and Calls do not create a register def.
+    if (isa<StoreInst>(I) || isa<CallInst>(I))
+      return true;
+  
+    // If Op is a kill then it will not be live-out from its basic block
+    // but the reverse is not true.
+    for (unsigned op = 0, e = I->getNumOperands(); op != e; ++op) {
+      Value *Op = I->getOperand(op);
+      // if (isa<Constant>(Op))
+      //  continue;
+      if (isLiveOutUsingMergeSet(I->getParent(), Op))
         return false;
+      // It is always profitable to hoist when the liveness does not increase,
+      // a Kill will compensate for the def created by this instruction.
+      const Instruction *LU = lastUser(I, Op);
+      if (LU == I)
+        return true;
+      else {
+        // We optimistically assume that if all the users of Op are hoistable
+        // candidates then it is profitable to hoist.
+        bool stillProfitable = true;
+        for (const User *U : Op->users()) {
+          if (!hoistCandidate(U)) {
+            stillProfitable = false;
+            break;
+          }
+          LLVM_DEBUG(dbgs() << "\nstill hoistable:" << *U);
+        }
+        if (stillProfitable)
+          return true;
+      }
     }
-    return true;
+    return false;
+  }
+
+  void partitionCandidates(SmallVecImplInsn &InstructionsToHoist,
+                                     HoistingPointList &HPL,
+                                     InsKind K) {
+  
+    // No need to sort for two instructions.
+    if (InstructionsToHoist.size() > 2) {
+      SortByDFSIn Pred(DFSNumber);
+      std::sort(InstructionsToHoist.begin(), InstructionsToHoist.end(), Pred);
+    }
+  
+    int NumBBsOnAllPaths = MaxNumberOfBBSInPath;
+  
+    SmallVecImplInsn::iterator II = InstructionsToHoist.begin();
+    SmallVecImplInsn::iterator Start = II;
+    Instruction *HoistPt = *II;
+    BasicBlock *HoistPtBB = HoistPt->getParent();
+    MemoryUseOrDef *MA;
+    if (K != InsKind::Scalar)
+      MA = MSSA->getMemoryAccess(HoistPt);
+  
+    for (++II; II != InstructionsToHoist.end(); ++II) {
+      Instruction *Insn = *II;
+      BasicBlock *InsnBB = Insn->getParent();
+      BasicBlock *NewHoistBB;
+      Instruction *NewHoistPt;
+  
+      if (InsnBB == HoistPtBB) { // Both are in the same Basic Block.
+        NewHoistBB = HoistPtBB;
+        NewHoistPt = firstInBB(Insn, HoistPt) ? Insn : HoistPt;
+      } else {
+        // If the hoisting point contains one of the instructions,
+        // then hoist there, otherwise hoist before the terminator.
+        NewHoistBB = DT->findNearestCommonDominator(HoistPtBB, InsnBB);
+        if (NewHoistBB == InsnBB)
+          NewHoistPt = Insn;
+        else if (NewHoistBB == HoistPtBB)
+          NewHoistPt = HoistPt;
+        else
+          NewHoistPt = NewHoistBB->getTerminator();
+      }
+  
+      SmallPtrSet<const BasicBlock *, 2> WL;
+      WL.insert(HoistPtBB);
+      WL.insert(InsnBB);
+  
+      // When NewBB already contains an instruction to be hoisted, the
+      // expression is needed on all paths.
+      // Check that the hoisted expression is needed on all paths: it is
+      // unsafe to hoist loads to a place where there may be a path not
+      // loading from the same address: for instance there may be a branch on
+      // which the address of the load may not be initialized.
+      if (K == InsKind::Scalar) {
+        if (hoistingFromAllPaths(NewHoistBB, WL) && safeToHoistScalar(NewHoistBB, HoistPtBB, NumBBsOnAllPaths)
+            && safeToHoistScalar(NewHoistBB, InsnBB, NumBBsOnAllPaths) && profitableToHoist(Insn)) {
+  
+          // Extend HoistPt to NewHoistPt.
+          HoistPt = NewHoistPt;
+          HoistPtBB = NewHoistBB;
+          continue;
+        }
+      } else {
+        if (safeToHoistLdSt_0(NewHoistPt, HoistPt, Insn, MA, K, NumBBsOnAllPaths,
+                              HoistPtBB, NewHoistBB, InsnBB, WL) &&
+            // Hoist loads when hoiting to pred BB even if liveness increases.
+            (profitableToHoist(Insn) ||
+             InsnBB->getSinglePredecessor() == NewHoistBB)) {
+          // Extend HoistPt to NewHoistPt.
+          HoistPt = NewHoistPt;
+          HoistPtBB = NewHoistBB;
+          continue;
+        }
+      }
+  
+      // At this point it is not safe to extend the current hoisting to
+      // NewHoistPt: save the hoisting list so far.
+      if (std::distance(Start, II) > 1)
+        HPL.push_back({HoistPtBB, SmallVecInsn(Start, II)});
+  
+      // Start over from BB.
+      Start = II;
+      if (K != InsKind::Scalar)
+        MA = MSSA->getMemoryAccess(*Start);
+      HoistPt = Insn;
+      HoistPtBB = InsnBB;
+      NumBBsOnAllPaths = MaxNumberOfBBSInPath;
+    }
+  
+    // Save the last partition.
+    if (std::distance(Start, II) > 1)
+      HPL.push_back({HoistPtBB, SmallVecInsn(Start, II)});
+  }
+
+  void findHoistableInsn(const VNtoInsns &Map,
+                                   HoistingPointList &HPL,
+                                   InsKind K) {
+    for (const auto &Entry : Map) {
+      if (MaxHoistedThreshold != -1 && ++HoistedCtr > MaxHoistedThreshold)
+        return;
+  
+      const SmallVecInsn &V = Entry.second;
+      if (V.size() < 2)
+        continue;
+  
+      // Compute the insertion point and the list of expressions to be hoisted.
+      SmallVecInsn InstructionsToHoist;
+      for (auto I : V) {
+        // We don't need to check for hoist-barriers here because if
+        // I->getParent() has a barrier then I precedes the barrier.
+        if (!hasEH(I->getParent()))
+          InstructionsToHoist.push_back(I);
+      }
+  
+      if (!InstructionsToHoist.empty())
+        partitionCandidates(InstructionsToHoist, HPL, K);
+    }
   }
 
   // Check if it is safe to hoist values tracked by CHI in the range
@@ -737,6 +1239,8 @@ private:
 
   // Compute insertion points for each values which can be fully anticipated at
   // a dominator. HPL contains all such values.
+  //
+  /*
   void computeInsertionPoints(const VNtoInsns &Map, HoistingPointList &HPL,
                               InsKind K) {
     // Sort VNs based on their rankings
@@ -810,6 +1314,7 @@ private:
     // Using the CHI args inserted at each PDF, find fully anticipable values.
     findHoistableCandidates(OutValue, K, HPL);
   }
+  */
 
   // Return true when all operands of Instr are available at insertion point
   // HoistPt. When limiting the number of hoisted expressions, one could hoist
@@ -1080,11 +1585,7 @@ private:
   // Hoist all expressions. Returns Number of scalars hoisted
   // and number of non-scalars hoisted.
   std::pair<unsigned, unsigned> hoistExpressions(Function &F) {
-    InsnInfo II;
-    LoadInfo LI;
-    StoreInfo SI;
-    CallInfo CI;
-    for (BasicBlock *BB : depth_first(&F.getEntryBlock())) {
+      for (BasicBlock *BB : depth_first(&F.getEntryBlock())) {
       int InstructionNb = 0;
       for (Instruction &I1 : *BB) {
         // If I1 cannot guarantee progress, subsequent instructions
@@ -1130,12 +1631,19 @@ private:
     }
 
     HoistingPointList HPL;
-    computeInsertionPoints(II.getVNTable(), HPL, InsKind::Scalar);
-    computeInsertionPoints(LI.getVNTable(), HPL, InsKind::Load);
-    computeInsertionPoints(SI.getVNTable(), HPL, InsKind::Store);
-    computeInsertionPoints(CI.getScalarVNTable(), HPL, InsKind::Scalar);
-    computeInsertionPoints(CI.getLoadVNTable(), HPL, InsKind::Load);
-    computeInsertionPoints(CI.getStoreVNTable(), HPL, InsKind::Store);
+    findHoistableInsn(II.getVNTable(), HPL, InsKind::Scalar);
+    findHoistableInsn(LI.getVNTable(), HPL, InsKind::Load);
+    findHoistableInsn(SI.getVNTable(), HPL, InsKind::Store);
+    findHoistableInsn(CI.getScalarVNTable(), HPL, InsKind::Scalar);
+    findHoistableInsn(CI.getLoadVNTable(), HPL, InsKind::Load);
+    findHoistableInsn(CI.getStoreVNTable(), HPL, InsKind::Store);
+   
+//    computeInsertionPoints(II.getVNTable(), HPL, InsKind::Scalar);
+//    computeInsertionPoints(LI.getVNTable(), HPL, InsKind::Load);
+//    computeInsertionPoints(SI.getVNTable(), HPL, InsKind::Store);
+//    computeInsertionPoints(CI.getScalarVNTable(), HPL, InsKind::Scalar);
+//    computeInsertionPoints(CI.getLoadVNTable(), HPL, InsKind::Load);
+//    computeInsertionPoints(CI.getStoreVNTable(), HPL, InsKind::Store);
     return hoist(HPL);
   }
 };
