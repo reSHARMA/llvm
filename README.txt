@@ -1,18 +1,17 @@
-The LLVM Compiler Infrastructure
-================================
+# Rebasing and Benchmarking of D32140
 
-This directory and its subdirectories contain source code for LLVM,
-a toolkit for the construction of highly optimized compilers,
-optimizers, and runtime environments.
-
-LLVM is open source software. You may freely distribute it under the terms of
-the license agreement found in LICENSE.txt.
-
-Please see the documentation provided in docs/ for further
-assistance with LLVM, and in particular docs/GettingStarted.rst for getting
-started with LLVM and docs/README.txt for an overview of LLVM's
-documentation setup.
-
-If you are writing a package for LLVM, see docs/Packaging.rst for our
-suggestions.
-
+### [x] Rebase syntactically
+### [ ] Fix failing tese cases
+#### - [ ] - Code Hoisting related tests
+* [ ] 28682     LLVM :: Transforms/GVNHoist/hoist-convergent.ll
+* [ ] 28683     LLVM :: Transforms/GVNHoist/hoist-inline.ll
+* [ ] 28684     LLVM :: Transforms/GVNHoist/hoist-more-than-two-branches.ll
+* [ ] 28685     LLVM :: Transforms/GVNHoist/hoist-pr20242.ll
+* [ ] 28686     LLVM :: Transforms/GVNHoist/hoist-recursive-geps.ll
+* [ ] 28687     LLVM :: Transforms/GVNHoist/hoist.ll
+* [ ] 28688     LLVM :: Transforms/GVNHoist/infinite-loop-direct.ll
+* [ ] 28689     LLVM :: Transforms/GVNHoist/infinite-loop-indirect.ll
+* [ ] 28690     LLVM :: Transforms/GVNHoist/pr36787.ll
+* [ ] 28691     LLVM :: Transforms/GVNHoist/pr37445.ll
+#### - [ ] - 190 tests (all related to ARM, will see them later :)
+### [ ] Benchmarking
