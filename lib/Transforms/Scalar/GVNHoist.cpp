@@ -48,7 +48,6 @@
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
 #include "llvm/Analysis/PostDominators.h"
-#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/BasicBlock.h"
@@ -73,6 +72,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
 #include <cassert>
 #include <iterator>
@@ -160,7 +160,7 @@ public:
     } else {
       ADFS = DFSNumber.lookup(BA);
       BDFS = DFSNumber.lookup(BB);
-    }    
+    }
     assert(ADFS && BDFS);
     return ADFS < BDFS;
   }
@@ -285,12 +285,15 @@ public:
 };
 
 static void combineKnownMetadata(Instruction *ReplInst, Instruction *I) {
-   unsigned KnownIDs[] = {
-      LLVMContext::MD_tbaa,           LLVMContext::MD_alias_scope,
-      LLVMContext::MD_noalias,        LLVMContext::MD_range,
-      LLVMContext::MD_fpmath,         LLVMContext::MD_invariant_load,
-      LLVMContext::MD_invariant_group,	LLVMContext::MD_access_group};
-      combineMetadata(ReplInst, I, KnownIDs,true);
+  unsigned KnownIDs[] = {LLVMContext::MD_tbaa,
+                         LLVMContext::MD_alias_scope,
+                         LLVMContext::MD_noalias,
+                         LLVMContext::MD_range,
+                         LLVMContext::MD_fpmath,
+                         LLVMContext::MD_invariant_load,
+                         LLVMContext::MD_invariant_group,
+                         LLVMContext::MD_access_group};
+  combineMetadata(ReplInst, I, KnownIDs, true);
 }
 
 void printBBLevels(const BBLevelT &BBLevels) {
@@ -340,9 +343,9 @@ public:
            MemoryDependenceResults *MD, MemorySSA *MSSA)
       : DT(DT), PDT(PDT), AA(AA), MD(MD), MSSA(MSSA),
         MSSAUpdater(llvm::make_unique<MemorySSAUpdater>(MSSA)), HoistedCtr(0) {
-		clearVNTables();
+    clearVNTables();
   }
-  
+
   void clearVNTables() {
     II.clear();
     LI.clear();
@@ -355,22 +358,22 @@ public:
   // DJ Graph is described in "Sreedhar, Vugranam C. Efficient program analysis
   // using DJ graphs. McGill University, 1996".
   void constructDJGraph(DomLevelsT &DomLevels, DenseSet<EdgeT> &JEdges,
-                        BBLevelT &BBLevels){
-  for (auto DFI = df_begin(DT->getRootNode()), DFE = df_end(DT->getRootNode());
-       DFI != DFE; ++DFI) {
-    // Since getPathLength is inclusive of both the terminal nodes
-    // i.e., Entry and *DFI so decrease by 1.
-    unsigned Depth = DFI.getPathLength() - 1;
-    BasicBlock *BB = (*DFI)->getBlock();
-    DomLevels[BB] = Depth;
-    BBLevels[Depth].push_back(BB);
-    for (BasicBlock *Succ : successors(BB))
-      if (!DT->properlyDominates(BB, Succ)) {
-        JEdges.insert(std::make_pair(BB, Succ));
-      }
+                        BBLevelT &BBLevels) {
+    for (auto DFI = df_begin(DT->getRootNode()),
+              DFE = df_end(DT->getRootNode());
+         DFI != DFE; ++DFI) {
+      // Since getPathLength is inclusive of both the terminal nodes
+      // i.e., Entry and *DFI so decrease by 1.
+      unsigned Depth = DFI.getPathLength() - 1;
+      BasicBlock *BB = (*DFI)->getBlock();
+      DomLevels[BB] = Depth;
+      BBLevels[Depth].push_back(BB);
+      for (BasicBlock *Succ : successors(BB))
+        if (!DT->properlyDominates(BB, Succ)) {
+          JEdges.insert(std::make_pair(BB, Succ));
+        }
+    }
   }
-}
-
 
   // Return true if S1 is a subset of S2.
   bool isSubset(const SmallSetBB &S1, const SmallSetBB &S2) {
@@ -389,12 +392,12 @@ public:
   // BILARDI, G. AND PINGALI, K. 2003. Algorithms for computing the static
   // single assignment form. J. ACM 50, 3 (May), 375–425.
   bool constructMergeSet(DomLevelsT &DomLevels, DenseSet<EdgeT> &JEdges,
-                         BBLevelT &BBLevels){
+                         BBLevelT &BBLevels) {
     bool Repeat = false;
     DenseSet<EdgeT> VisJEdges; // Visited J Edges.
     unsigned PrevLev = 0;
-    if(PrevLev == 0){
-    	Repeat = false;
+    if (PrevLev == 0) {
+      Repeat = false;
     }
     for (std::pair<const unsigned, BBLevelKeyT> &P : BBLevels) {
       assert(PrevLev <= P.first);
@@ -411,13 +414,13 @@ public:
             MergeSet[Dst].insert(Dst);                 // The target of JEdge.
             while (DomLevels[Src] >= DomLevels[Dst]) { // A backedge.
               LLVM_DEBUG(dbgs() << "\nVisiting: " << Src->getName() << " -> "
-                           << Dst->getName());
+                                << Dst->getName());
               // Merge (tmp) = Merge (tmp) U Merge (tnode) U { tnode }
               // MergeSet(tnode) contains tnode.
               MergeSet[Src].insert(MergeSet[Dst].begin(), MergeSet[Dst].end());
               INode = Src;
               LLVM_DEBUG(dbgs() << "IDom of " << Src->getName() << " is ");
-	      Src = DT -> getNode(Src) -> getIDom() -> getBlock();
+              Src = DT->getNode(Src)->getIDom()->getBlock();
               LLVM_DEBUG(dbgs() << Src->getName());
             }
             for (auto PINode = pred_begin(INode), PENode = pred_end(INode);
@@ -435,91 +438,83 @@ public:
         }
       }
     }
-  return Repeat;
-}
-
-
-
-     // Returns true if the \p Op is live-out from \p BB.
-  bool isLiveOutUsingMergeSet(BasicBlock *BB, Value *Val) const{
-  assert(BB);
-  const BasicBlock *ValDefBB = nullptr; // BasicBlock defining Val
-  if (Instruction *I = dyn_cast<Instruction>(Val))
-    ValDefBB = I->getParent();
-  // FIXME!
-  // We are assuming when DefBB is not defined then the value is a parameter.
-
-  // Case when Val is defined in BB, if any of the use is outside BB (DefBB)
-  // then it must be live-out.
-  if (ValDefBB == BB)
-    for (User *U : Val->users()) {
-      if (cast<Instruction>(U)->getParent() != BB)
-        return true;
-    }
-
-  // Mr(n) = M(n) U {n}; Create a new set from the merge set
-  // Ms(n) = Ms(n) U Mr(w); For each successor w of BB
-  SmallSetBB Ms; // Ms = null-set
-  for (BasicBlock *Succ : successors(BB)) {
-    Ms.insert(Succ); // Mr(Succ) = Succ U M(Succ)
-    for (BasicBlock *BB : MergeSet.lookup(Succ))
-      Ms.insert(BB); // M(Succ)
+    return Repeat;
   }
 
-  // Iterate over all the uses of Val, if any of its users is in the mergeset
-  // of \p BB then Val is LiveOut from BB.
-  for (User *U : Val->users()) {
-    BasicBlock *UserDefBB = nullptr;
-    if (Instruction *I = dyn_cast<Instruction>(U))
-      UserDefBB = I->getParent();
-    else // Assuming live-out conservatively, the user can be a global
-      // TODO: maybe return false is okay??
-      return false; // llvm_unreachable("User is not an instruction.");
-    while (UserDefBB && (UserDefBB != ValDefBB)) {
-      if (Ms.count(UserDefBB)) // if t /\ Ms(n) then return true;
-        return true;
-	DomTreeNode *pdtNode = DT -> getNode(UserDefBB) -> getIDom();
-	if(pdtNode == NULL)
-		break;
-  errs() << "Hello 4\n";
-      UserDefBB = pdtNode -> getBlock();
-      
-    }
-  }
-  return false;
-}
+  // Returns true if the \p Op is live-out from \p BB.
+  bool isLiveOutUsingMergeSet(BasicBlock *BB, Value *Val) const {
+    assert(BB);
+    const BasicBlock *ValDefBB = nullptr; // BasicBlock defining Val
+    if (Instruction *I = dyn_cast<Instruction>(Val))
+      ValDefBB = I->getParent();
+    // FIXME!
+    // We are assuming when DefBB is not defined then the value is a parameter.
 
-// Returns true if the \p Op is the last use at I.
-  // TODO: Find O(1) algorithm for this.
-const Instruction *lastUser(const Instruction *I, const Value *Val) const{
-  // TODO: Make isLiveOutUsingMergeSet take const parameters.
-  assert(!isLiveOutUsingMergeSet(const_cast<BasicBlock *>(I->getParent()),
-                                 const_cast<Value *>(Val)));
-  const BasicBlock *BB = I->getParent();
-  BasicBlock::const_iterator BI(I), BE = BB->end();
-  unsigned ICount = std::distance(BI, BE);
-  if (Val->getNumUses() <= ICount) { // Iterate on uses
-    for (const User *U : Val->users()) {
-      const Instruction *UserI = cast<Instruction>(U);
-      if (UserI != I && UserI->getParent() == BB) {
-        if (firstInBB(I, UserI)) // I precedes another Use => not a kill.
-          return UserI;
+    // Case when Val is defined in BB, if any of the use is outside BB (DefBB)
+    // then it must be live-out.
+    if (ValDefBB == BB)
+      for (User *U : Val->users()) {
+        if (cast<Instruction>(U)->getParent() != BB)
+          return true;
       }
+
+    // Mr(n) = M(n) U {n}; Create a new set from the merge set
+    // Ms(n) = Ms(n) U Mr(w); For each successor w of BB
+    SmallSetBB Ms; // Ms = null-set
+    for (BasicBlock *Succ : successors(BB)) {
+      Ms.insert(Succ); // Mr(Succ) = Succ U M(Succ)
+      for (BasicBlock *BB : MergeSet.lookup(Succ))
+        Ms.insert(BB); // M(Succ)
+    }
+
+    // Iterate over all the uses of Val, if any of its users is in the mergeset
+    // of \p BB then Val is LiveOut from BB.
+    for (User *U : Val->users()) {
+      BasicBlock *UserDefBB = nullptr;
+      if (Instruction *I = dyn_cast<Instruction>(U))
+        UserDefBB = I->getParent();
+      else // Assuming live-out conservatively, the user can be a global
+        // TODO: maybe return false is okay??
+        return false; // llvm_unreachable("User is not an instruction.");
+      while (UserDefBB && (UserDefBB != ValDefBB)) {
+        if (Ms.count(UserDefBB)) // if t /\ Ms(n) then return true;
+          return true;
+        UserDefBB = DT -> getNode(UserDefBB) -> getIDom() -> getBlock();
+      }
+    }
+    return false;
+  }
+
+  // Returns true if the \p Op is the last use at I.
+  // TODO: Find O(1) algorithm for this.
+  const Instruction *lastUser(const Instruction *I, const Value *Val) const {
+    // TODO: Make isLiveOutUsingMergeSet take const parameters.
+    assert(!isLiveOutUsingMergeSet(const_cast<BasicBlock *>(I->getParent()),
+                                   const_cast<Value *>(Val)));
+    const BasicBlock *BB = I->getParent();
+    BasicBlock::const_iterator BI(I), BE = BB->end();
+    unsigned ICount = std::distance(BI, BE);
+    if (Val->getNumUses() <= ICount) { // Iterate on uses
+      for (const User *U : Val->users()) {
+        const Instruction *UserI = cast<Instruction>(U);
+        if (UserI != I && UserI->getParent() == BB) {
+          if (firstInBB(I, UserI)) // I precedes another Use => not a kill.
+            return UserI;
+        }
+      }
+      return I;
+    }
+    // else Iterate on Instructions
+    for (++BI; BI != BE; ++BI) {
+      for (unsigned i = 0; i < BI->getNumOperands(); ++i)
+        if (BI->getOperandUse(i).get() == Val)
+          return &*BI;
     }
     return I;
   }
-  // else Iterate on Instructions
-  for (++BI; BI != BE; ++BI) {
-    for (unsigned i = 0; i < BI->getNumOperands(); ++i)
-      if (BI->getOperandUse(i).get() == Val)
-        return &*BI;
-  }
-  return I;
-}
-
 
   bool run(Function &F) {
-  
+
     // *** if -Oz option which is optimize for min size then,
     // checkHoistProfitability is false, which is true by default
     if (F.optForMinSize()) {
@@ -810,8 +805,8 @@ private:
   }
 
   bool hoistingFromAllPaths(const BasicBlock *HoistBB,
-                                    SmallPtrSetImpl<const BasicBlock *> &WL) {
-  // Copy WL as the loop will remove elements from it.
+                            SmallPtrSetImpl<const BasicBlock *> &WL) {
+    // Copy WL as the loop will remove elements from it.
     SmallPtrSet<const BasicBlock *, 2> WorkList(WL.begin(), WL.end());
     for (auto It = df_begin(HoistBB), E = df_end(HoistBB); It != E;) {
       // There exists a path from HoistBB to the exit of the function if we are
@@ -881,25 +876,22 @@ private:
   }
 
   bool safeToHoistLdSt_0(const Instruction *NewHoistPt,
-                                 const Instruction *HoistPt,
-                                 const Instruction *Insn, MemoryUseOrDef *MA,
-                                 InsKind K, int &NumBBsOnAllPaths,
-                                 const BasicBlock *HoistPtBB,
-                                 const BasicBlock *NewHoistBB,
-                                 const BasicBlock *InsnBB,
-                                 SmallPtrSetImpl<const BasicBlock *> &WL) {
+                         const Instruction *HoistPt, const Instruction *Insn,
+                         MemoryUseOrDef *MA, InsKind K, int &NumBBsOnAllPaths,
+                         const BasicBlock *HoistPtBB,
+                         const BasicBlock *NewHoistBB, const BasicBlock *InsnBB,
+                         SmallPtrSetImpl<const BasicBlock *> &WL) {
     return (HoistPtBB == NewHoistBB || InsnBB == NewHoistBB ||
-          hoistingFromAllPaths(NewHoistBB, WL)) &&
-         // Also check that it is safe to move the load or store from HoistPt
-         // to NewHoistPt, and from Insn to NewHoistPt. Note that HoistPt may
-         // not be the instruction to be hoisted, it is a transient placeholder
-         // to find the farthest hoisting point when >2 hoistable candidates
-         // can be hoisted to a common dominator.
-         safeToHoistLdSt(NewHoistPt, HoistPt, MA, K, NumBBsOnAllPaths) &&
-         safeToHoistLdSt(NewHoistPt, Insn, MSSA->getMemoryAccess(Insn), K,
-                         NumBBsOnAllPaths);
+            hoistingFromAllPaths(NewHoistBB, WL)) &&
+           // Also check that it is safe to move the load or store from HoistPt
+           // to NewHoistPt, and from Insn to NewHoistPt. Note that HoistPt may
+           // not be the instruction to be hoisted, it is a transient
+           // placeholder to find the farthest hoisting point when >2 hoistable
+           // candidates can be hoisted to a common dominator.
+           safeToHoistLdSt(NewHoistPt, HoistPt, MA, K, NumBBsOnAllPaths) &&
+           safeToHoistLdSt(NewHoistPt, Insn, MSSA->getMemoryAccess(Insn), K,
+                           NumBBsOnAllPaths);
   }
- 
 
   // Return true when it is safe to hoist scalar instructions from all blocks in
   // WL to HoistBB.
@@ -923,18 +915,18 @@ private:
 
   // Returns true when the values are flowing out to each edge.
   bool valueAnticipable(CHIArgs C, Instruction *TI) const {
-	if (TI->getNumSuccessors() > (unsigned)size(C))
-       return false; // Not enough args in this CHI.
- 
-     for (auto CHI : C) {
-       BasicBlock *Dest = CHI.Dest;
-       // Find if all the edges have values flowing out of BB.
-       bool Found = llvm::any_of(
-           successors(TI), [Dest](const BasicBlock *BB) { return BB == Dest; });
-       if (!Found)
-         return false;
-     }
-     return true;
+    if (TI->getNumSuccessors() > (unsigned)size(C))
+      return false; // Not enough args in this CHI.
+
+    for (auto CHI : C) {
+      BasicBlock *Dest = CHI.Dest;
+      // Find if all the edges have values flowing out of BB.
+      bool Found = llvm::any_of(
+          successors(TI), [Dest](const BasicBlock *BB) { return BB == Dest; });
+      if (!Found)
+        return false;
+    }
+    return true;
   }
 
   bool profitableToHoist(Instruction *I) const {
@@ -945,7 +937,7 @@ private:
     // Store and Calls do not create a register def.
     if (isa<StoreInst>(I) || isa<CallInst>(I))
       return true;
-  
+
     // If Op is a kill then it will not be live-out from its basic block
     // but the reverse is not true.
     for (unsigned op = 0, e = I->getNumOperands(); op != e; ++op) {
@@ -978,17 +970,16 @@ private:
   }
 
   void partitionCandidates(SmallVecImplInsn &InstructionsToHoist,
-                                     HoistingPointList &HPL,
-                                     InsKind K) {
-  
+                           HoistingPointList &HPL, InsKind K) {
+
     // No need to sort for two instructions.
     if (InstructionsToHoist.size() > 2) {
       SortByDFSIn Pred(DFSNumber);
       std::sort(InstructionsToHoist.begin(), InstructionsToHoist.end(), Pred);
     }
-  
+
     int NumBBsOnAllPaths = MaxNumberOfBBSInPath;
-  
+
     SmallVecImplInsn::iterator II = InstructionsToHoist.begin();
     SmallVecImplInsn::iterator Start = II;
     Instruction *HoistPt = *II;
@@ -996,13 +987,13 @@ private:
     MemoryUseOrDef *MA;
     if (K != InsKind::Scalar)
       MA = MSSA->getMemoryAccess(HoistPt);
-  
+
     for (++II; II != InstructionsToHoist.end(); ++II) {
       Instruction *Insn = *II;
       BasicBlock *InsnBB = Insn->getParent();
       BasicBlock *NewHoistBB;
       Instruction *NewHoistPt;
-  
+
       if (InsnBB == HoistPtBB) { // Both are in the same Basic Block.
         NewHoistBB = HoistPtBB;
         NewHoistPt = firstInBB(Insn, HoistPt) ? Insn : HoistPt;
@@ -1017,11 +1008,11 @@ private:
         else
           NewHoistPt = NewHoistBB->getTerminator();
       }
-  
+
       SmallPtrSet<const BasicBlock *, 2> WL;
       WL.insert(HoistPtBB);
       WL.insert(InsnBB);
-  
+
       // When NewBB already contains an instruction to be hoisted, the
       // expression is needed on all paths.
       // Check that the hoisted expression is needed on all paths: it is
@@ -1029,17 +1020,20 @@ private:
       // loading from the same address: for instance there may be a branch on
       // which the address of the load may not be initialized.
       if (K == InsKind::Scalar) {
-        if (hoistingFromAllPaths(NewHoistBB, WL) && safeToHoistScalar(NewHoistBB, HoistPtBB, NumBBsOnAllPaths)
-            && safeToHoistScalar(NewHoistBB, InsnBB, NumBBsOnAllPaths) && profitableToHoist(Insn)) {
-  
+        if (hoistingFromAllPaths(NewHoistBB, WL) &&
+            safeToHoistScalar(NewHoistBB, HoistPtBB, NumBBsOnAllPaths) &&
+            safeToHoistScalar(NewHoistBB, InsnBB, NumBBsOnAllPaths) &&
+            profitableToHoist(Insn)) {
+
           // Extend HoistPt to NewHoistPt.
           HoistPt = NewHoistPt;
           HoistPtBB = NewHoistBB;
           continue;
         }
       } else {
-        if (safeToHoistLdSt_0(NewHoistPt, HoistPt, Insn, MA, K, NumBBsOnAllPaths,
-                              HoistPtBB, NewHoistBB, InsnBB, WL) &&
+        if (safeToHoistLdSt_0(NewHoistPt, HoistPt, Insn, MA, K,
+                              NumBBsOnAllPaths, HoistPtBB, NewHoistBB, InsnBB,
+                              WL) &&
             // Hoist loads when hoiting to pred BB even if liveness increases.
             (profitableToHoist(Insn) ||
              InsnBB->getSinglePredecessor() == NewHoistBB)) {
@@ -1049,12 +1043,12 @@ private:
           continue;
         }
       }
-  
+
       // At this point it is not safe to extend the current hoisting to
       // NewHoistPt: save the hoisting list so far.
       if (std::distance(Start, II) > 1)
         HPL.push_back({HoistPtBB, SmallVecInsn(Start, II)});
-  
+
       // Start over from BB.
       Start = II;
       if (K != InsKind::Scalar)
@@ -1063,23 +1057,22 @@ private:
       HoistPtBB = InsnBB;
       NumBBsOnAllPaths = MaxNumberOfBBSInPath;
     }
-  
+
     // Save the last partition.
     if (std::distance(Start, II) > 1)
       HPL.push_back({HoistPtBB, SmallVecInsn(Start, II)});
   }
 
-  void findHoistableInsn(const VNtoInsns &Map,
-                                   HoistingPointList &HPL,
-                                   InsKind K) {
+  void findHoistableInsn(const VNtoInsns &Map, HoistingPointList &HPL,
+                         InsKind K) {
     for (const auto &Entry : Map) {
       if (MaxHoistedThreshold != -1 && ++HoistedCtr > MaxHoistedThreshold)
         return;
-  
+
       const SmallVecInsn &V = Entry.second;
       if (V.size() < 2)
         continue;
-  
+
       // Compute the insertion point and the list of expressions to be hoisted.
       SmallVecInsn InstructionsToHoist;
       for (auto I : V) {
@@ -1088,7 +1081,7 @@ private:
         if (!hasEH(I->getParent()))
           InstructionsToHoist.push_back(I);
       }
-  
+
       if (!InstructionsToHoist.empty())
         partitionCandidates(InstructionsToHoist, HPL, K);
     }
@@ -1210,7 +1203,7 @@ private:
       auto B = CHIs.begin();
       // [PreIt, PHIIt) form a range of CHIs which have identical VNs.
       auto PHIIt = std::find_if(CHIs.begin(), CHIs.end(),
-                                 [B](CHIArg &A) { return A != *B; });
+                                [B](CHIArg &A) { return A != *B; });
       auto PrevIt = CHIs.begin();
       while (PrevIt != PHIIt) {
         // Collect values which satisfy safety checks.
@@ -1395,9 +1388,8 @@ private:
 
   void updateAlignment(Instruction *I, Instruction *Repl) {
     if (auto *ReplacementLoad = dyn_cast<LoadInst>(Repl)) {
-      ReplacementLoad->setAlignment(
-          std::min(ReplacementLoad->getAlignment(),
-                   cast<LoadInst>(I)->getAlignment()));
+      ReplacementLoad->setAlignment(std::min(
+          ReplacementLoad->getAlignment(), cast<LoadInst>(I)->getAlignment()));
       ++NumLoadsRemoved;
     } else if (auto *ReplacementStore = dyn_cast<StoreInst>(Repl)) {
       ReplacementStore->setAlignment(
@@ -1413,8 +1405,8 @@ private:
     }
   }
 
-  // Remove all the instructions in Candidates and replace their usage with Repl.
-  // Returns the number of instructions removed.
+  // Remove all the instructions in Candidates and replace their usage with
+  // Repl. Returns the number of instructions removed.
   unsigned rauw(const SmallVecInsn &Candidates, Instruction *Repl,
                 MemoryUseOrDef *NewMemAcc) {
     unsigned NR = 0;
@@ -1461,9 +1453,9 @@ private:
                             BasicBlock *DestBB, bool MoveAccess) {
     MemoryUseOrDef *NewMemAcc = MSSA->getMemoryAccess(Repl);
     if (MoveAccess && NewMemAcc) {
-        // The definition of this ld/st will not change: ld/st hoisting is
-        // legal when the ld/st is not moved past its current definition.
-        MSSAUpdater->moveToPlace(NewMemAcc, DestBB, MemorySSA::End);
+      // The definition of this ld/st will not change: ld/st hoisting is
+      // legal when the ld/st is not moved past its current definition.
+      MSSAUpdater->moveToPlace(NewMemAcc, DestBB, MemorySSA::End);
     }
 
     // Replace all other instructions with Repl with memory access NewMemAcc.
@@ -1585,7 +1577,7 @@ private:
   // Hoist all expressions. Returns Number of scalars hoisted
   // and number of non-scalars hoisted.
   std::pair<unsigned, unsigned> hoistExpressions(Function &F) {
-      for (BasicBlock *BB : depth_first(&F.getEntryBlock())) {
+    for (BasicBlock *BB : depth_first(&F.getEntryBlock())) {
       int InstructionNb = 0;
       for (Instruction &I1 : *BB) {
         // If I1 cannot guarantee progress, subsequent instructions
@@ -1637,13 +1629,13 @@ private:
     findHoistableInsn(CI.getScalarVNTable(), HPL, InsKind::Scalar);
     findHoistableInsn(CI.getLoadVNTable(), HPL, InsKind::Load);
     findHoistableInsn(CI.getStoreVNTable(), HPL, InsKind::Store);
-   
-//    computeInsertionPoints(II.getVNTable(), HPL, InsKind::Scalar);
-//    computeInsertionPoints(LI.getVNTable(), HPL, InsKind::Load);
-//    computeInsertionPoints(SI.getVNTable(), HPL, InsKind::Store);
-//    computeInsertionPoints(CI.getScalarVNTable(), HPL, InsKind::Scalar);
-//    computeInsertionPoints(CI.getLoadVNTable(), HPL, InsKind::Load);
-//    computeInsertionPoints(CI.getStoreVNTable(), HPL, InsKind::Store);
+
+    //    computeInsertionPoints(II.getVNTable(), HPL, InsKind::Scalar);
+    //    computeInsertionPoints(LI.getVNTable(), HPL, InsKind::Load);
+    //    computeInsertionPoints(SI.getVNTable(), HPL, InsKind::Store);
+    //    computeInsertionPoints(CI.getScalarVNTable(), HPL, InsKind::Scalar);
+    //    computeInsertionPoints(CI.getLoadVNTable(), HPL, InsKind::Load);
+    //    computeInsertionPoints(CI.getStoreVNTable(), HPL, InsKind::Store);
     return hoist(HPL);
   }
 };
