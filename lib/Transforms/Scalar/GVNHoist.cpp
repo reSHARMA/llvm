@@ -502,6 +502,8 @@ public:
     unsigned ICount = std::distance(BI, BE);
     if (Val->getNumUses() <= ICount) { // Iterate on uses
       for (const User *U : Val->users()) {
+        if (!isa<Instruction>(U))
+          continue;
         const Instruction *UserI = cast<Instruction>(U);
         if (UserI != I && UserI->getParent() == BB) {
           if (firstInBB(I, UserI)) // I precedes another Use => not a kill.
