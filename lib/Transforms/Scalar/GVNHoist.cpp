@@ -479,10 +479,13 @@ public:
       while (UserDefBB && (UserDefBB != ValDefBB)) {
         if (Ms.count(UserDefBB)) // if t /\ Ms(n) then return true;
           return true;
-        DomTreeNode *IDomNode = DT->getNode(UserDefBB)->getIDom();
-        if (IDomNode == NULL)
+        DomTreeNode *DTNode = DT->getNode(UserDefBB);
+        if (DTNode == NULL)
           break;
-        UserDefBB = IDomNode->getBlock();
+        DomTreeNode *IDNode = DTNode->getIDom();
+        if (IDNode == NULL)
+          break;
+        UserDefBB = IDNode->getBlock();
       }
     }
     return false;
