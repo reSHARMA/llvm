@@ -85,6 +85,7 @@ using namespace llvm;
 #define DEBUG_TYPE "gvn-hoist"
 
 STATISTIC(NumHoisted, "Number of instructions hoisted");
+STATISTIC(NumSunk, "Number of instructions sunk");
 STATISTIC(NumRemoved, "Number of instructions removed");
 STATISTIC(NumLoadsHoisted, "Number of loads hoisted");
 STATISTIC(NumLoadsRemoved, "Number of loads removed");
@@ -574,7 +575,8 @@ public:
 
       Res = true;
     }
-
+    clearVNTables();
+    sinkExpressions(F);
     return Res;
   }
 
@@ -977,6 +979,118 @@ private:
     return false;
   }
 
+  bool profitableToSink(Instruction *I) const {
+    if (!CheckHoistProfitability)
+      return true;
+    // For -O3/-O2 hoist only when the liveness decreases i.e., no more than
+    // one operand can be a use without kill.
+    // Store and Calls do not create a register def.
+    if (isa<StoreInst>(I) || isa<CallInst>(I))
+      return true;
+    unsigned NumKills = 0;
+    for (unsigned op = 0, e = I->getNumOperands(); op != e; ++op) {
+      Value *Op = I->getOperand(op);
+      // It is always profitable to sink when the liveness does not increase.
+      if (isLiveOutUsingMergeSet(I->getParent(), Op))
+        continue;
+      // A Kill will increase the liveness during a sink.
+      const Instruction *LU = lastUser(I, Op);
+      if (LU == I && ++NumKills > 1)
+        return false;
+    }
+    return false;
+  }
+
+  void setAlignment(Instruction *I, Instruction *Repl) {
+    if (auto *ReplacementLoad = dyn_cast<LoadInst>(Repl)) {
+        ReplacementLoad->setAlignment(
+                    std::min(ReplacementLoad->getAlignment(),
+                             cast<LoadInst>(I)->getAlignment()));
+        ++NumLoadsRemoved;
+    } else if (auto *ReplacementStore = dyn_cast<StoreInst>(Repl)) {
+        ReplacementStore->setAlignment(
+                    std::min(ReplacementStore->getAlignment(),
+                             cast<StoreInst>(I)->getAlignment()));
+        ++NumStoresRemoved;
+    } else if (auto *ReplacementAlloca = dyn_cast<AllocaInst>(Repl)) {
+        ReplacementAlloca->setAlignment(
+                    std::max(ReplacementAlloca->getAlignment(),
+                             cast<AllocaInst>(I)->getAlignment()));
+    } else if (isa<CallInst>(Repl)) {
+        ++NumCallsRemoved;
+    }
+  }
+
+  std::pair<unsigned, unsigned> sink(HoistingPointList &HPL) {
+    unsigned NI = 0, NL = 0, NS = 0, NC = 0;
+    for (const HoistingPointInfo &HP : HPL) {
+      BasicBlock *SinkPt = HP.first;
+      const SmallVecInsn &InstructionsToHoist = HP.second;
+      assert(InstructionsToHoist.size() == 2);
+      Instruction *I0 = InstructionsToHoist[0];
+      Instruction *I1 = InstructionsToHoist[1];
+
+      // We need to check availability for I0 and I1. TODO: Additionally, we can
+      // still sink if the operand not available is also getting sunk will
+      // available operands.
+      if (!allOperandsAvailable(I0, SinkPt) ||
+          !allOperandsAvailable(I1, SinkPt))
+        continue;
+      // Keep I0 and remove I1 and PN
+      PHINode *PN = cast<PHINode>(I0->user_back());
+      MemoryAccess *I0MemAccess = MSSA->getMemoryAccess(I0);
+      LLVM_DEBUG(dbgs() << "\nSinking:" << *I0 << *I1 << *PN);
+
+      setAlignment(I1, I0);
+      I0->andIRFlags(I1);
+      combineKnownMetadata(I0, I1);
+      MD->removeInstruction(I1);
+      MD->removeInstruction(PN);
+      PN->replaceAllUsesWith(I0);
+
+      bool found = false;
+      auto It = SinkPt->begin();
+      while (It != SinkPt->end()) { // Find the last PHI to insert I0
+        if (!isa<PHINode>(It))
+          break;
+        if (PN == &*It)
+          found = true;
+        ++It;
+      }
+      assert(found && "PHI replaced in wrong BB");
+      I0->moveBefore(*SinkPt, It);
+
+      if (I0MemAccess) { // I0, I1 are mem-refs
+        assert(MSSA->getMemoryAccess(I1));
+        // This MSSA update is only for mem-refs with one use in a PHI in Succ
+        // BB.
+        MemoryAccess *I1MemAccess = MSSA->getMemoryAccess(I1);
+        MemoryUseOrDef *I0UD = cast<MemoryUseOrDef>(I0MemAccess);
+        MemoryUseOrDef *I1UD = cast<MemoryUseOrDef>(I1MemAccess);
+
+        MemoryAccess *I0Def = I0UD->getDefiningAccess();
+        MemoryAccess *I1Def = I1UD->getDefiningAccess();
+
+        MemoryPhi *NewPHI = MSSA->getMemoryAccess(SinkPt);
+        if (!NewPHI) {
+          NewPHI = MSSA->createMemoryPhi(SinkPt);
+          NewPHI->addIncoming(I0Def, I0->getParent());
+          NewPHI->addIncoming(I1Def, I1->getParent());
+        }
+
+        I0UD->setDefiningAccess(NewPHI);
+        MSSAUpdater->removeMemoryAccess(I0MemAccess);
+        MSSAUpdater->removeMemoryAccess(I1MemAccess);
+      }
+
+      PN->eraseFromParent();
+      I1->eraseFromParent();
+
+      NumSunk++;
+    }
+    return {NI, NL + NC + NS};
+  }
+
   void partitionCandidates(SmallVecImplInsn &InstructionsToHoist,
                            HoistingPointList &HPL, InsKind K) {
 
@@ -1092,6 +1206,102 @@ private:
 
       if (!InstructionsToHoist.empty())
         partitionCandidates(InstructionsToHoist, HPL, K);
+    }
+  }
+
+  bool safeToSinkToEnd(Instruction *I, BasicBlock *BB, InsKind K) {
+    BasicBlock::iterator II(I);
+    auto IMA = MSSA->getMemoryAccess(I);
+    assert (IMA);
+    if (MemoryUseOrDef *I0UD = cast<MemoryUseOrDef>(IMA)) {
+      // Only sink loads for now.
+      if (!isa<MemoryUse>(I0UD))
+        return false;
+  
+      //MemoryAccess *Def = I0UD->getDefiningAccess();
+  
+      /*/ Updating Memory PHI is tricky, bail out for now.
+      for (User *U : Def->users())
+        if (isa<MemoryPhi>(U))
+          return false;*/
+    }
+  
+    while (++II != BB->end()) { // Skip I
+      auto IIMA = MSSA->getMemoryAccess(&*II);
+      // TODO: Bails out on any memory writes for now, improve for non-aliases.
+      if (IIMA) {
+        if (!isa<MemoryUse>(IIMA))
+          return false;
+      }
+    }
+    return true;
+  }
+
+  void findSinkableInsn(const VNtoInsns &Map, HoistingPointList &HPL,
+                        InsKind K) {
+    // Sort the VNs by rank, higher ranked should be sunk first.
+    // SmallVector<unsigned, 8> SortedRank;
+    // sortByRank(SortedRank, Map);
+    for (const auto &Entry : Map) {
+      const SmallVecInsn &V = Entry.second;
+      if (V.size() < 2)
+        continue;
+
+      // Only sink to common post-dom
+      SmallVecInsn InstructionsToSink;
+      for (Instruction *I : V) {
+        auto BB = I->getParent();
+        // All the sinkable instructions are collected after any barrier in
+        // a basic block so no need to check for barrier BBs.
+
+        // The instruction should have only one user i.e., PHI in the Succ
+        // TODO: Handle store, calls etc. without users
+        unsigned NumUsers = std::distance(I->user_begin(), I->user_end());
+        if (NumUsers != 1)
+          continue;
+
+        // The only user should be a PHI.
+        if (!isa<PHINode>(I->user_back()))
+          continue;
+
+        // Sink to single successor.
+        if (auto Succ = BB->getSingleSuccessor()) {
+          if (I->user_back()->getParent() != Succ)
+            continue; // PHI should be in the immediate successor.
+          // The successor should have exactly two predecessors.
+          unsigned NumPreds = std::distance(pred_begin(Succ), pred_end(Succ));
+          if (NumPreds != 2)
+            continue;
+
+          // Sinkable instruction found, check for safety and profitability.
+          // As the instructions are from a basic block without barriers, we can
+          // sink this instruction as long as there is no hazard.
+          if (K != InsKind::Scalar && !safeToSinkToEnd(I, BB, K))
+            continue;
+          if (!profitableToSink(I))
+            continue;
+
+          // We don't need to check for barriers here because the instruction
+          // will be sunk at the beginning of a basic block i.e., before any
+          // barrier, and I is after any barriers in I->getParent().
+          if (!hasEH(Succ))
+            InstructionsToSink.push_back(I);
+        }
+      }
+
+      // assert(InstructionsToSink.size() < 3 && "Test case");
+      // Sort V such that adjacent Instructions share common PDom.
+      if (InstructionsToSink.size() != 2)
+        continue;
+      // assert(InstructionsToSink.size() != 2 && "Test case");
+      // There should be a unique PHI using I0 and I1 to be legally sinkable.
+      if (InstructionsToSink[0]->user_back() ==
+          InstructionsToSink[1]->user_back()) {
+        auto Succ0 = InstructionsToSink[0]->getParent()->getSingleSuccessor();
+        auto Succ1 = InstructionsToSink[1]->getParent()->getSingleSuccessor();
+        assert(Succ0 == Succ1);
+        HPL.push_back({Succ0, InstructionsToSink});
+      }
     }
   }
 
@@ -1580,6 +1790,61 @@ private:
     NumStoresHoisted += NS;
     NumCallsHoisted += NC;
     return {NI, NL + NC + NS};
+  }
+
+  std::pair<unsigned, unsigned> sinkExpressions(Function &F) {
+    for (BasicBlock *BB : depth_first(&F.getEntryBlock())) {
+      int InstructionNb = 0;
+      for (Instruction &I1 : *BB) {
+        // If I1 cannot guarantee progress, subsequent instructions
+        // in BB cannot be hoisted anyways.
+        if (!isGuaranteedToTransferExecutionToSuccessor(&I1)) {
+          HoistBarrier.insert(BB);
+          break;
+        }
+        // Only hoist the first instructions in BB up to MaxDepthInBB. Hoisting
+        // deeper may increase the register pressure and compilation time.
+        if (MaxDepthInBB != -1 && InstructionNb++ >= MaxDepthInBB)
+          break;
+
+        // Do not value number terminator instructions.
+        if (I1.isTerminator())
+          break;
+
+        if (auto *Load = dyn_cast<LoadInst>(&I1))
+          LI.insert(Load, VN);
+        else if (auto *Store = dyn_cast<StoreInst>(&I1))
+          SI.insert(Store, VN);
+        else if (auto *Call = dyn_cast<CallInst>(&I1)) {
+          if (auto *Intr = dyn_cast<IntrinsicInst>(Call)) {
+            if (isa<DbgInfoIntrinsic>(Intr) ||
+                Intr->getIntrinsicID() == Intrinsic::assume ||
+                Intr->getIntrinsicID() == Intrinsic::sideeffect)
+              continue;
+          }
+          if (Call->mayHaveSideEffects())
+            break;
+
+          if (Call->isConvergent())
+            break;
+
+          CI.insert(Call, VN);
+        } else if (HoistingGeps || !isa<GetElementPtrInst>(&I1))
+          // Do not hoist scalars past calls that may write to memory because
+          // that could result in spills later. geps are handled separately.
+          // TODO: We can relax this for targets like AArch64 as they have more
+          // registers than X86.
+          II.insert(&I1, VN);
+      }
+    }
+    HoistingPointList HPL;
+    findSinkableInsn(II.getVNTable(), HPL, InsKind::Scalar);
+    findSinkableInsn(LI.getVNTable(), HPL, InsKind::Load);
+    findSinkableInsn(SI.getVNTable(), HPL, InsKind::Store);
+    findSinkableInsn(CI.getScalarVNTable(), HPL, InsKind::Scalar);
+    findSinkableInsn(CI.getLoadVNTable(), HPL, InsKind::Load);
+    findSinkableInsn(CI.getStoreVNTable(), HPL, InsKind::Store);
+    return sink(HPL);
   }
 
   // Hoist all expressions. Returns Number of scalars hoisted

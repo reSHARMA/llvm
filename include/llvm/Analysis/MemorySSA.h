@@ -247,6 +247,16 @@ public:
   void *operator new(size_t) = delete;
 
   DECLARE_TRANSPARENT_OPERAND_ACCESSORS(MemoryAccess);
+  void setDefiningAccess(MemoryAccess *DMA, bool Optimized = false,
+                         Optional<AliasResult> AR = MayAlias) {
+    if (!Optimized) {
+      setOperand(0, DMA);
+      return;
+    }
+    setOptimized(DMA);
+    setOptimizedAccessType(AR);
+  }
+
 
   /// Get the instruction that this MemoryUse represents.
   Instruction *getMemoryInst() const { return MemoryInstruction; }
@@ -292,16 +302,6 @@ protected:
 
   void setOptimizedAccessType(Optional<AliasResult> AR) {
     OptimizedAccessAlias = AR;
-  }
-
-  void setDefiningAccess(MemoryAccess *DMA, bool Optimized = false,
-                         Optional<AliasResult> AR = MayAlias) {
-    if (!Optimized) {
-      setOperand(0, DMA);
-      return;
-    }
-    setOptimized(DMA);
-    setOptimizedAccessType(AR);
   }
 
 private:
@@ -706,6 +706,7 @@ public:
   MemorySSAWalker *getWalker();
   MemorySSAWalker *getSkipSelfWalker();
 
+  MemoryPhi *createMemoryPhi(BasicBlock *BB);
   /// Given a memory Mod/Ref'ing instruction, get the MemorySSA
   /// access associated with it. If passed a basic block gets the memory phi
   /// node that exists for that block, if there is one. Otherwise, this will get
@@ -849,7 +850,6 @@ private:
   determineInsertionPoint(const SmallPtrSetImpl<BasicBlock *> &DefiningBlocks);
   void markUnreachableAsLiveOnEntry(BasicBlock *BB);
   bool dominatesUse(const MemoryAccess *, const MemoryAccess *) const;
-  MemoryPhi *createMemoryPhi(BasicBlock *BB);
   MemoryUseOrDef *createNewAccess(Instruction *,
                                   const MemoryUseOrDef *Template = nullptr);
   MemoryAccess *findDominatingDef(BasicBlock *, enum InsertionPlace);
